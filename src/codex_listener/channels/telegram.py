@@ -163,11 +163,12 @@ def _build_message(
     
     # Assistant message
     if assistant_message:
-        truncated = assistant_message[:2000]
-        if len(assistant_message) > 2000:
-            truncated += "\n..."
+        escaped_truncated = _escape_and_truncate_markdown_v2(
+            assistant_message,
+            MAX_ASSISTANT_ESCAPED_LEN,
+        )
         lines.append("*Codex Response:*")
-        lines.append(f"```\n{truncated}\n```")
+        lines.append(escaped_truncated)
     else:
         lines.append("*Codex Response:* \\(none\\)")
 
