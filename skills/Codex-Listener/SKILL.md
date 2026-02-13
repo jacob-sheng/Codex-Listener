@@ -114,7 +114,20 @@ Status handling:
 
 Plan Bridge handling:
 - If `bridge_stage=needs_input`: ask user for answers. Preferred reply format is `/plan-reply <task_id> <answer>`.
+- Telegram 菜单命令可无参选任务：
+  - `/plan-reply` 显示可回复任务列表（含 `needs_input` 与 `none`）
+  - `/plan-run` 显示可执行 `plan_ready` 列表
+  - `/plan-cancel` 显示可取消任务列表（`pending/running`）
+- Plan 执行权限选择：
+  - `/plan-run` 先选权限模式（Sandbox 或 Full Access）再二次确认执行
+  - 文本兼容：`/plan-run <task_id> sandbox|full`
+  - 禁止依赖后端默认 sandbox；执行任务必须显式传权限
+- 普通任务权限闸门（listener 侧）：
+  - 普通任务若未显式提供 sandbox，listener 会返回 `needs_input` 权限问题
+  - 在 Telegram 里用 `/plan-reply <task_id> sandbox|full`（或按钮预填）完成权限选择
+  - 仅在权限确定后才会创建真实执行任务
 - Natural-language reply is allowed only when there is exactly one pending `needs_input` task; otherwise require explicit `/plan-reply`.
+- Replying directly to a Codex-Listener notification message can auto-bind its `Task <task_id>`.
 - Continue by resubmitting with `--resume-session <session_id>` and `--parent-task-id <task_id>`.
 - Telegram button semantics:
   - `✍️ 回复问题`: only pre-fills `/plan-reply <task_id> `, user must still send the final answer text.

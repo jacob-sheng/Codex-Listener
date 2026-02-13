@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import re
@@ -14,6 +15,27 @@ from datetime import datetime, timezone
 from codex_listener.models import TaskCreate, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+PERMISSION_GATE_TIMEOUT_SECONDS = 900
+PERMISSION_GATE_SESSION_PREFIX = "perm:"
+PERMISSION_GATE_QUESTION = "请选择本次权限：回复 sandbox 或 full。"
+PERMISSION_GATE_INVALID_QUESTION = (
+    "未识别权限输入，请回复 sandbox 或 full。"
+    "如再次无效将默认使用 sandbox。"
+)
+
+
+@dataclass
+class PermissionGateContext:
+    """In-memory context for a pending permission selection."""
+
+    prompt: str
+    model: str
+    cwd: str
+    full_auto: bool
+    reasoning_effort: str
+    invalid_replies: int = 0
+    timeout_task: asyncio.Task[None] | None = None
 
 
 class TaskManager:
@@ -30,6 +52,7 @@ class TaskManager:
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._completed: OrderedDict[str, TaskStatus] = OrderedDict()
         self._bg_tasks: dict[str, asyncio.Task[None]] = {}
+        self._permission_gates: dict[str, PermissionGateContext] = {}
 
     @property
     def active_count(self) -> int:
@@ -51,6 +74,21 @@ class TaskManager:
 
     async def create_task(self, req: TaskCreate) -> TaskStatus:
         """Create and start a new Codex task."""
+        if self._is_permission_reply(req):
+            return await self._handle_permission_reply(req)
+
+        if self._is_stale_permission_reply(req):
+            raise RuntimeError(
+                "Permission gate is no longer active. Please resubmit the original task."
+            )
+
+        if self._should_open_permission_gate(req):
+            return await self._create_permission_gate(req, parent_task_id=req.parent_task_id)
+
+        return await self._enqueue_execution_task(req)
+
+    async def _enqueue_execution_task(self, req: TaskCreate) -> TaskStatus:
+        """Create a pending task and launch codex execution in background."""
         if self.active_count >= self.max_concurrent:
             raise RuntimeError(
                 f"Max concurrent tasks ({self.max_concurrent}) reached. "
@@ -103,10 +141,207 @@ class TaskManager:
         for task_id in list(self._tasks):
             await self.cancel_task(task_id)
 
+        for gate_task_id in list(self._permission_gates):
+            self._close_permission_gate(gate_task_id)
+
         # Wait for all background tasks to finish
         bg_tasks = list(self._bg_tasks.values())
         if bg_tasks:
             await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+    def _is_permission_reply(self, req: TaskCreate) -> bool:
+        """Check whether this request is a reply for a permission gate task."""
+        parent = (req.parent_task_id or "").strip()
+        if not parent:
+            return False
+        if parent not in self._permission_gates:
+            return False
+        return req.workflow_mode == "plan_bridge"
+
+    def _is_stale_permission_reply(self, req: TaskCreate) -> bool:
+        """Check whether request looks like a reply to an expired permission gate."""
+        if req.workflow_mode != "plan_bridge":
+            return False
+        parent = (req.parent_task_id or "").strip()
+        if not parent:
+            return False
+        parent_task = self.get_task(parent)
+        if parent_task is None:
+            return False
+        session_id = str(parent_task.session_id or "")
+        return session_id.startswith(PERMISSION_GATE_SESSION_PREFIX)
+
+    def _should_open_permission_gate(self, req: TaskCreate) -> bool:
+        """Decide whether this request must pass permission selection first."""
+        if req.workflow_mode != "normal":
+            return False
+        if req.resume_session_id:
+            return False
+        sandbox = (req.sandbox or "").strip()
+        return sandbox == ""
+
+    def _extract_user_answer(self, prompt: str) -> str:
+        """Best-effort extraction of user answer from nanobot-generated prompts."""
+        text = (prompt or "").strip()
+        if not text:
+            return ""
+        markers = ("用户回答：", "User answer:", "User response:", "Answer:")
+        for marker in markers:
+            idx = text.rfind(marker)
+            if idx >= 0:
+                return text[idx + len(marker):].strip()
+        return text
+
+    def _parse_permission_choice(self, answer: str) -> str | None:
+        """Parse sandbox/full choice from user answer text."""
+        raw = (answer or "").strip()
+        if not raw:
+            return None
+        lower = raw.lower()
+        has_full = bool(
+            re.search(r"\b(full|danger-full-access|danger_full_access)\b", lower)
+            or "全权限" in raw
+            or "高权限" in raw
+        )
+        has_sandbox = bool(
+            re.search(r"\b(sandbox|workspace-write|workspace_write|workspace)\b", lower)
+            or "沙箱" in raw
+        )
+        if has_full and not has_sandbox:
+            return "danger-full-access"
+        if has_sandbox and not has_full:
+            return "workspace-write"
+        return None
+
+    def _close_permission_gate(self, task_id: str) -> None:
+        """Remove permission gate context and cancel its timeout watcher."""
+        ctx = self._permission_gates.pop(task_id, None)
+        if not ctx or not ctx.timeout_task:
+            return
+        if not ctx.timeout_task.done():
+            ctx.timeout_task.cancel()
+
+    async def _expire_permission_gate(self, task_id: str) -> None:
+        """Fail gate task if user does not choose permission in time."""
+        try:
+            await asyncio.sleep(PERMISSION_GATE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            return
+
+        ctx = self._permission_gates.pop(task_id, None)
+        if ctx is None:
+            return
+
+        task = self.get_task(task_id)
+        if task is None:
+            return
+        if task.status != "completed" or task.bridge_stage != "needs_input":
+            return
+
+        task.status = "failed"
+        task.error = (
+            f"Permission selection timed out after {PERMISSION_GATE_TIMEOUT_SECONDS} seconds."
+        )
+        task.bridge_stage = "none"
+        task.bridge_questions = None
+        task.completed_at = datetime.now(timezone.utc)
+        task.output = "权限选择超时，任务已取消。"
+        await self._notify(task)
+
+    async def _create_permission_gate(
+        self,
+        req: TaskCreate,
+        *,
+        parent_task_id: str | None,
+        invalid_replies: int = 0,
+        question: str = PERMISSION_GATE_QUESTION,
+    ) -> TaskStatus:
+        """Create a synthetic needs_input task to ask user for permission mode."""
+        task_id = self._gen_task_id()
+        now = datetime.now(timezone.utc)
+        task = TaskStatus(
+            task_id=task_id,
+            status="completed",
+            output=question,
+            created_at=now,
+            completed_at=now,
+            workflow_mode="plan_bridge",
+            parent_task_id=parent_task_id,
+            session_id=f"{PERMISSION_GATE_SESSION_PREFIX}{task_id}",
+            bridge_stage="needs_input",
+            bridge_questions=[question],
+            bridge_plan=None,
+        )
+
+        self._tasks[task_id] = task
+        self._archive_task(task_id)
+
+        ctx = PermissionGateContext(
+            prompt=req.prompt,
+            model=req.model,
+            cwd=req.cwd,
+            full_auto=req.full_auto,
+            reasoning_effort=req.reasoning_effort,
+            invalid_replies=invalid_replies,
+        )
+        timeout_task = asyncio.create_task(
+            self._expire_permission_gate(task_id),
+            name=f"permission-gate-timeout-{task_id}",
+        )
+        ctx.timeout_task = timeout_task
+        self._permission_gates[task_id] = ctx
+
+        await self._notify(task)
+        return task
+
+    async def _handle_permission_reply(self, req: TaskCreate) -> TaskStatus:
+        """Handle /plan-reply style continuation for permission gate tasks."""
+        parent_task_id = (req.parent_task_id or "").strip()
+        ctx = self._permission_gates.get(parent_task_id)
+        if ctx is None:
+            raise RuntimeError(f"Permission gate context not found for task {parent_task_id}")
+
+        answer = self._extract_user_answer(req.prompt)
+        sandbox = self._parse_permission_choice(answer)
+
+        if sandbox is None and ctx.invalid_replies == 0:
+            self._close_permission_gate(parent_task_id)
+            follow_req = TaskCreate(
+                prompt=ctx.prompt,
+                model=ctx.model,
+                cwd=ctx.cwd,
+                sandbox=None,
+                full_auto=ctx.full_auto,
+                reasoning_effort=ctx.reasoning_effort,
+                workflow_mode="normal",
+                parent_task_id=parent_task_id,
+            )
+            return await self._create_permission_gate(
+                follow_req,
+                parent_task_id=parent_task_id,
+                invalid_replies=1,
+                question=PERMISSION_GATE_INVALID_QUESTION,
+            )
+
+        if sandbox is None:
+            sandbox = "workspace-write"
+            logger.warning(
+                "Permission reply still invalid for gate %s, fallback to sandbox",
+                parent_task_id,
+            )
+
+        self._close_permission_gate(parent_task_id)
+        run_req = TaskCreate(
+            prompt=ctx.prompt,
+            model=ctx.model,
+            cwd=ctx.cwd,
+            sandbox=sandbox,
+            full_auto=ctx.full_auto,
+            reasoning_effort=ctx.reasoning_effort,
+            workflow_mode="normal",
+            parent_task_id=parent_task_id,
+        )
+        return await self._enqueue_execution_task(run_req)
 
     async def _run_task(self, task_id: str, req: TaskCreate) -> None:
         """Spawn codex subprocess and monitor its output."""
@@ -182,7 +417,8 @@ class TaskManager:
     async def _notify(self, task: TaskStatus, summary: object | None = None) -> None:
         """Send notifications (Feishu/Telegram) with session details after task completion."""
         from codex_listener.config import get_feishu_config, get_telegram_config, get_qq_config
-        from codex_listener.channels import send_feishu_notification, send_telegram_notification, send_qq_notification
+        from codex_listener.channels.feishu import send_feishu_notification
+        from codex_listener.channels.telegram import send_telegram_notification
         from codex_listener.session_parser import get_session_summary
 
         feishu_cfg = get_feishu_config()
@@ -192,8 +428,15 @@ class TaskManager:
         if feishu_cfg is None and telegram_cfg is None and qq_cfg is None:
             return
 
-        # Parse the session JSONL to get detailed results
-        if summary is None:
+        is_permission_timeout_failure = (
+            task.status == "failed"
+            and bool(task.error)
+            and str(task.error).startswith("Permission selection timed out")
+            and str(task.session_id or "").startswith(PERMISSION_GATE_SESSION_PREFIX)
+        )
+
+        # Parse the session JSONL to get detailed results unless this is a synthetic timeout failure.
+        if summary is None and not is_permission_timeout_failure:
             summary = get_session_summary(task.created_at, task.completed_at)
         logger.info(
             "Notify task %s: summary=%s assistant_msg_len=%s",
@@ -204,9 +447,13 @@ class TaskManager:
             else 0,
         )
 
-        assistant_msg = (
-            summary.last_assistant_message if summary else task.output
-        )
+        if is_permission_timeout_failure:
+            assistant_msg = (
+                "失败原因：权限选择超时，15 分钟内未回复 sandbox/full，"
+                "任务已自动取消。"
+            )
+        else:
+            assistant_msg = summary.last_assistant_message if summary else task.output
         completed_at = (
             summary.completed_at
             if summary
@@ -250,6 +497,7 @@ class TaskManager:
                     task_id=task.task_id,
                     status=task.status,
                     assistant_message=assistant_msg,
+                    error_reason=task.error if task.status == "failed" else None,
                     total_tokens=(
                         summary.total_tokens if summary else None
                     ),
@@ -276,25 +524,34 @@ class TaskManager:
         if qq_cfg is not None:
             logger.info("Sending QQ notification for task %s", task.task_id)
             try:
-                await send_qq_notification(
-                    config=qq_cfg,
-                    task_id=task.task_id,
-                    status=task.status,
-                    assistant_message=assistant_msg,
-                    total_tokens=(
-                        summary.total_tokens if summary else None
-                    ),
-                    input_tokens=(
-                        summary.input_tokens if summary else None
-                    ),
-                    output_tokens=(
-                        summary.output_tokens if summary else None
-                    ),
-                    reasoning_tokens=(
-                        summary.reasoning_tokens if summary else None
-                    ),
-                    completed_at=completed_at,
-                )
+                try:
+                    from codex_listener.channels.qq import send_qq_notification
+                except ModuleNotFoundError as e:
+                    logger.warning(
+                        "QQ notification skipped for task %s: missing dependency (%s)",
+                        task.task_id,
+                        e,
+                    )
+                else:
+                    await send_qq_notification(
+                        config=qq_cfg,
+                        task_id=task.task_id,
+                        status=task.status,
+                        assistant_message=assistant_msg,
+                        total_tokens=(
+                            summary.total_tokens if summary else None
+                        ),
+                        input_tokens=(
+                            summary.input_tokens if summary else None
+                        ),
+                        output_tokens=(
+                            summary.output_tokens if summary else None
+                        ),
+                        reasoning_tokens=(
+                            summary.reasoning_tokens if summary else None
+                        ),
+                        completed_at=completed_at,
+                    )
             except Exception:
                 logger.exception(
                     "QQ notification failed for task %s", task.task_id,
@@ -478,6 +735,7 @@ class TaskManager:
 
     def _build_command(self, req: TaskCreate) -> list[str]:
         """Build the codex exec command line."""
+        sandbox = (req.sandbox or "workspace-write").strip() or "workspace-write"
         if req.resume_session_id:
             cmd = [
                 "codex",
@@ -495,15 +753,15 @@ class TaskManager:
                 "--json",
                 "--skip-git-repo-check",
                 "--model", req.model,
-                "--sandbox", req.sandbox,
+                "--sandbox", sandbox,
                 "-c", f"model_reasoning_effort=\"{req.reasoning_effort}\"",
             ]
         if req.full_auto:
             # NOTE: `codex exec resume` does not support `--sandbox`.
             # Keep behavior consistent by mapping sandbox intent to supported flags.
-            if req.sandbox == "workspace-write":
+            if sandbox == "workspace-write":
                 cmd.append("--full-auto")
-            elif req.sandbox == "danger-full-access":
+            elif sandbox == "danger-full-access":
                 cmd.append("--dangerously-bypass-approvals-and-sandbox")
             else:
                 cmd.extend(["-c", "approval_policy=\"never\""])
@@ -520,4 +778,5 @@ class TaskManager:
         self._completed[task_id] = task
         # Evict oldest if over limit
         while len(self._completed) > self.max_completed:
-            self._completed.popitem(last=False)
+            evicted_task_id, _ = self._completed.popitem(last=False)
+            self._close_permission_gate(evicted_task_id)

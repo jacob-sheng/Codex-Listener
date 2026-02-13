@@ -13,6 +13,7 @@ from codex_listener.config import TelegramConfig
 
 logger = logging.getLogger(__name__)
 NOTIFIER_NAME = "Codex-Listener"
+MAX_ASSISTANT_ESCAPED_LEN = 2800
 
 
 def _build_api_url(token: str, method: str) -> str:
@@ -91,9 +92,49 @@ def _escape_markdown_v2(text: str) -> str:
     return text
 
 
-def _build_reply_markup(task_id: str, bridge_stage: str | None) -> dict[str, object] | None:
+def _escape_and_truncate_markdown_v2(text: str, max_len: int) -> str:
+    """Escape text for MarkdownV2 and cap message size safely."""
+    escaped = _escape_markdown_v2(text)
+    if len(escaped) <= max_len:
+        return escaped
+    suffix = "\\.\\.\\."
+    cut = max(0, max_len - len(suffix))
+    return escaped[:cut] + suffix
+
+
+def _looks_like_permission_gate(bridge_questions: list[str] | None) -> bool:
+    """Heuristic: detect permission gate prompts from question content."""
+    if not bridge_questions:
+        return False
+    for question in bridge_questions:
+        q = str(question or "").lower()
+        if ("sandbox" in q and "full" in q) or ("权限" in question):
+            return True
+    return False
+
+
+def _build_reply_markup(
+    task_id: str,
+    bridge_stage: str | None,
+    bridge_questions: list[str] | None,
+) -> dict[str, object] | None:
     """Build Telegram inline keyboard for Plan Bridge stages."""
     if bridge_stage == "needs_input":
+        if _looks_like_permission_gate(bridge_questions):
+            return {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "🧱 沙箱",
+                            "switch_inline_query_current_chat": f"/plan-reply {task_id} sandbox",
+                        },
+                        {
+                            "text": "⚠️ Full",
+                            "switch_inline_query_current_chat": f"/plan-reply {task_id} full",
+                        },
+                    ]
+                ]
+            }
         return {
             "inline_keyboard": [
                 [
@@ -134,6 +175,7 @@ def _build_message(
     task_id: str,
     status: str,
     assistant_message: str | None,
+    error_reason: str | None,
     total_tokens: int | None,
     input_tokens: int | None,
     output_tokens: int | None,
@@ -156,6 +198,8 @@ def _build_message(
     
     if completed_at:
         lines.append(f"*Completed:* {_escape_markdown_v2(completed_at)}")
+    if status == "failed" and error_reason:
+        lines.append(f"*Failure Reason:* {_escape_markdown_v2(error_reason)}")
     
     lines.append("")
     lines.append("─" * 30)
@@ -216,6 +260,7 @@ def _build_plain_message(
     task_id: str,
     status: str,
     assistant_message: str | None,
+    error_reason: str | None,
     total_tokens: int | None,
     input_tokens: int | None,
     output_tokens: int | None,
@@ -234,6 +279,8 @@ def _build_plain_message(
     ]
     if completed_at:
         lines.append(f"Completed: {completed_at}")
+    if status == "failed" and error_reason:
+        lines.append(f"Failure reason: {error_reason}")
 
     lines.append("")
     lines.append("Codex Response:")
@@ -280,6 +327,7 @@ def _do_send(
     task_id: str,
     status: str,
     assistant_message: str | None,
+    error_reason: str | None,
     total_tokens: int | None,
     input_tokens: int | None,
     output_tokens: int | None,
@@ -290,12 +338,13 @@ def _do_send(
     bridge_plan: str | None,
 ) -> None:
     """Synchronous: send message to all recipients."""
-    reply_markup = _build_reply_markup(task_id, bridge_stage)
+    reply_markup = _build_reply_markup(task_id, bridge_stage, bridge_questions)
 
     markdown_message = _build_message(
         task_id=task_id,
         status=status,
         assistant_message=assistant_message,
+        error_reason=error_reason,
         total_tokens=total_tokens,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -309,6 +358,7 @@ def _do_send(
         task_id=task_id,
         status=status,
         assistant_message=assistant_message,
+        error_reason=error_reason,
         total_tokens=total_tokens,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -347,6 +397,7 @@ async def send_telegram_notification(
     task_id: str,
     status: str,
     assistant_message: str | None = None,
+    error_reason: str | None = None,
     total_tokens: int | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
@@ -366,6 +417,7 @@ async def send_telegram_notification(
             task_id=task_id,
             status=status,
             assistant_message=assistant_message,
+            error_reason=error_reason,
             total_tokens=total_tokens,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
