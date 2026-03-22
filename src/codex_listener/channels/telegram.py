@@ -113,6 +113,91 @@ def _looks_like_permission_gate(bridge_questions: list[str] | None) -> bool:
     return False
 
 
+def _preview_text(text: str | None, *, max_len: int = 700, max_lines: int = 8) -> str | None:
+    """Return a short preview suitable for chat notifications."""
+    if not text:
+        return None
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return None
+    preview = "\n".join(lines[:max_lines]).strip()
+    if len(preview) > max_len:
+        preview = preview[: max_len - 3].rstrip() + "..."
+    elif len(lines) > max_lines:
+        preview += "\n..."
+    return preview
+
+
+def _build_bridge_markdown_lines(
+    task_id: str,
+    bridge_stage: str | None,
+    bridge_questions: list[str] | None,
+    bridge_plan: str | None,
+) -> list[str]:
+    """Build human-oriented markdown lines for plan bridge tasks."""
+    if bridge_stage == "needs_input":
+        lines = ["*下一步：补充信息后继续规划*", ""]
+        if bridge_questions:
+            for index, question in enumerate(bridge_questions, 1):
+                lines.append(f"{index}\\. {_escape_markdown_v2(str(question).strip())}")
+        else:
+            lines.append(_escape_markdown_v2("请补充必要信息后继续。"))
+        lines.extend(
+            [
+                "",
+                f"直接回复：`/plan\\-reply {_escape_markdown_v2(task_id)} <你的回答>`",
+            ]
+        )
+        return lines
+
+    if bridge_stage == "plan_ready":
+        lines = ["*计划已准备好，等待你决定是否执行*", ""]
+        preview = _preview_text(bridge_plan, max_len=900, max_lines=10)
+        if preview:
+            lines.append(_escape_markdown_v2(preview))
+            lines.append("")
+        lines.append(
+            f"可直接点按钮，或发送：`/plan\\-run {_escape_markdown_v2(task_id)} sandbox|full`"
+        )
+        return lines
+
+    return [
+        "*计划结果已生成，但还未被标准化*",
+        _escape_markdown_v2("可查看任务状态或继续回复这条通知来补充计划。"),
+    ]
+
+
+def _build_bridge_plain_lines(
+    task_id: str,
+    bridge_stage: str | None,
+    bridge_questions: list[str] | None,
+    bridge_plan: str | None,
+) -> list[str]:
+    """Build plain-text user-oriented lines for plan bridge tasks."""
+    if bridge_stage == "needs_input":
+        lines = ["下一步：补充信息后继续规划", ""]
+        if bridge_questions:
+            lines.extend(f"{index}. {question}" for index, question in enumerate(bridge_questions, 1))
+        else:
+            lines.append("请补充必要信息后继续。")
+        lines.extend(["", f"直接回复：/plan-reply {task_id} <你的回答>"])
+        return lines
+
+    if bridge_stage == "plan_ready":
+        lines = ["计划已准备好，等待你决定是否执行", ""]
+        preview = _preview_text(bridge_plan, max_len=1200, max_lines=10)
+        if preview:
+            lines.extend(preview.splitlines())
+            lines.append("")
+        lines.append(f"可直接点按钮，或发送：/plan-run {task_id} sandbox|full")
+        return lines
+
+    return [
+        "计划结果已生成，但还未被标准化。",
+        "可查看任务状态或继续回复这条通知来补充计划。",
+    ]
+
+
 def _build_reply_markup(
     task_id: str,
     bridge_stage: str | None,
@@ -174,6 +259,7 @@ def _build_reply_markup(
 def _build_message(
     task_id: str,
     status: str,
+    workflow_mode: str | None,
     assistant_message: str | None,
     error_reason: str | None,
     total_tokens: int | None,
@@ -205,8 +291,17 @@ def _build_message(
     lines.append("─" * 30)
     lines.append("")
     
-    # Assistant message
-    if assistant_message:
+    is_plan_bridge = workflow_mode == "plan_bridge"
+    if is_plan_bridge:
+        lines.extend(
+            _build_bridge_markdown_lines(
+                task_id=task_id,
+                bridge_stage=bridge_stage,
+                bridge_questions=bridge_questions,
+                bridge_plan=bridge_plan,
+            )
+        )
+    elif assistant_message:
         escaped_truncated = _escape_and_truncate_markdown_v2(
             assistant_message,
             MAX_ASSISTANT_ESCAPED_LEN,
@@ -215,27 +310,6 @@ def _build_message(
         lines.append(escaped_truncated)
     else:
         lines.append("*Codex Response:* \\(none\\)")
-
-    if bridge_stage in {"needs_input", "plan_ready"}:
-        lines.append("")
-        lines.append("*Plan Bridge:*")
-        lines.append(f"Stage: `{_escape_markdown_v2(bridge_stage)}`")
-        if bridge_stage == "needs_input":
-            if bridge_questions:
-                lines.append("Questions:")
-                for i, q in enumerate(bridge_questions, 1):
-                    lines.append(
-                        f"{i}\\. {_escape_markdown_v2(str(q).strip())}"
-                    )
-            lines.append(
-                f"Reply template: `/plan\\-reply {_escape_markdown_v2(task_id)} <your answer>`"
-            )
-        elif bridge_stage == "plan_ready" and bridge_plan:
-            plan_preview = bridge_plan[:600]
-            if len(bridge_plan) > 600:
-                plan_preview += "\n..."
-            lines.append("Plan preview:")
-            lines.append(f"```\n{plan_preview}\n```")
     
     lines.append("")
     lines.append("─" * 30)
@@ -259,6 +333,7 @@ def _build_message(
 def _build_plain_message(
     task_id: str,
     status: str,
+    workflow_mode: str | None,
     assistant_message: str | None,
     error_reason: str | None,
     total_tokens: int | None,
@@ -282,15 +357,26 @@ def _build_plain_message(
     if status == "failed" and error_reason:
         lines.append(f"Failure reason: {error_reason}")
 
+    is_plan_bridge = workflow_mode == "plan_bridge"
     lines.append("")
-    lines.append("Codex Response:")
-    if assistant_message:
-        truncated = assistant_message[:2800]
-        if len(assistant_message) > 2800:
-            truncated += "\n..."
-        lines.append(truncated)
+    if is_plan_bridge:
+        lines.extend(
+            _build_bridge_plain_lines(
+                task_id=task_id,
+                bridge_stage=bridge_stage,
+                bridge_questions=bridge_questions,
+                bridge_plan=bridge_plan,
+            )
+        )
     else:
-        lines.append("(none)")
+        lines.append("Codex Response:")
+        if assistant_message:
+            truncated = assistant_message[:2800]
+            if len(assistant_message) > 2800:
+                truncated += "\n..."
+            lines.append(truncated)
+        else:
+            lines.append("(none)")
 
     if total_tokens is not None:
         parts = [f"{total_tokens:,} total"]
@@ -303,22 +389,6 @@ def _build_plain_message(
         lines.append("")
         lines.append(f"Token usage: {' / '.join(parts)}")
 
-    if bridge_stage in {"needs_input", "plan_ready"}:
-        lines.append("")
-        lines.append(f"Plan Bridge Stage: {bridge_stage}")
-        if bridge_stage == "needs_input":
-            if bridge_questions:
-                lines.append("Questions:")
-                for i, q in enumerate(bridge_questions, 1):
-                    lines.append(f"{i}. {q}")
-            lines.append(f"Reply template: /plan-reply {task_id} <your answer>")
-        elif bridge_stage == "plan_ready" and bridge_plan:
-            plan_preview = bridge_plan[:800]
-            if len(bridge_plan) > 800:
-                plan_preview += "\n..."
-            lines.append("Plan preview:")
-            lines.append(plan_preview)
-
     return "\n".join(lines)
 
 
@@ -326,6 +396,7 @@ def _do_send(
     config: TelegramConfig,
     task_id: str,
     status: str,
+    workflow_mode: str | None,
     assistant_message: str | None,
     error_reason: str | None,
     total_tokens: int | None,
@@ -343,6 +414,7 @@ def _do_send(
     markdown_message = _build_message(
         task_id=task_id,
         status=status,
+        workflow_mode=workflow_mode,
         assistant_message=assistant_message,
         error_reason=error_reason,
         total_tokens=total_tokens,
@@ -357,6 +429,7 @@ def _do_send(
     plain_message = _build_plain_message(
         task_id=task_id,
         status=status,
+        workflow_mode=workflow_mode,
         assistant_message=assistant_message,
         error_reason=error_reason,
         total_tokens=total_tokens,
@@ -396,6 +469,7 @@ async def send_telegram_notification(
     config: TelegramConfig,
     task_id: str,
     status: str,
+    workflow_mode: str | None = None,
     assistant_message: str | None = None,
     error_reason: str | None = None,
     total_tokens: int | None = None,
@@ -416,6 +490,7 @@ async def send_telegram_notification(
             config=config,
             task_id=task_id,
             status=status,
+            workflow_mode=workflow_mode,
             assistant_message=assistant_message,
             error_reason=error_reason,
             total_tokens=total_tokens,

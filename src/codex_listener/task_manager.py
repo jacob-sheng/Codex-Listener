@@ -11,6 +11,9 @@ import signal
 import uuid
 from collections import OrderedDict
 from datetime import datetime, timezone
+import textwrap
+
+import yaml
 
 from codex_listener.models import TaskCreate, TaskStatus
 
@@ -23,6 +26,26 @@ PERMISSION_GATE_INVALID_QUESTION = (
     "未识别权限输入，请回复 sandbox 或 full。"
     "如再次无效将默认使用 sandbox。"
 )
+PLAN_BRIDGE_PROTOCOL = textwrap.dedent(
+    """
+    You are operating in Plan Bridge mode.
+    Do not execute commands, edit files, or start implementation.
+    Your final answer must be exactly one JSON object, without markdown fences.
+
+    If more information or confirmation is required, return:
+    {"bridge":"planmode.v1","stage":"needs_input","questions":["question 1","question 2"]}
+
+    If the plan is ready for execution, return:
+    {"bridge":"planmode.v1","stage":"plan_ready","plan_markdown":"human-readable markdown plan"}
+
+    Rules:
+    - Always set bridge to "planmode.v1".
+    - Use only one of the two stages above.
+    - questions must be a JSON array of concise strings.
+    - plan_markdown must be concise markdown for humans to review in chat.
+    - Do not include extra prose before or after the JSON object.
+    """
+).strip()
 
 
 @dataclass
@@ -64,10 +87,15 @@ class TaskManager:
         return uuid.uuid4().hex[:8]
 
     def get_task(self, task_id: str) -> TaskStatus | None:
-        return self._tasks.get(task_id) or self._completed.get(task_id)
+        task = self._tasks.get(task_id) or self._completed.get(task_id)
+        if task is not None:
+            self._maybe_backfill_bridge_payload(task)
+        return task
 
     def list_tasks(self, status_filter: str | None = None) -> list[TaskStatus]:
         all_tasks = list(self._tasks.values()) + list(self._completed.values())
+        for task in all_tasks:
+            self._maybe_backfill_bridge_payload(task)
         if status_filter:
             all_tasks = [t for t in all_tasks if t.status == status_filter]
         return sorted(all_tasks, key=lambda t: t.created_at, reverse=True)
@@ -496,6 +524,7 @@ class TaskManager:
                     config=telegram_cfg,
                     task_id=task.task_id,
                     status=task.status,
+                    workflow_mode=task.workflow_mode,
                     assistant_message=assistant_msg,
                     error_reason=task.error if task.status == "failed" else None,
                     total_tokens=(
@@ -645,7 +674,7 @@ class TaskManager:
         return summary
 
     def _extract_bridge_payload(self, text: str | None) -> dict[str, object] | None:
-        """Extract bridge payload JSON from assistant output text."""
+        """Extract bridge payload from assistant output text."""
         if not text:
             return None
 
@@ -671,7 +700,16 @@ class TaskManager:
             except json.JSONDecodeError:
                 continue
 
-        # 3) Any raw JSON objects in free text
+        # 3) planmode.v1 fenced YAML blocks
+        for block in re.findall(r"```planmode\.v1\s*([\s\S]*?)```", text, re.IGNORECASE):
+            try:
+                obj = yaml.safe_load(block.strip())
+            except yaml.YAMLError:
+                continue
+            if isinstance(obj, dict):
+                candidates.append(obj)
+
+        # 4) Any raw JSON objects in free text
         idx = 0
         while idx < len(text):
             start = text.find("{", idx)
@@ -687,14 +725,275 @@ class TaskManager:
             idx = start + consumed
 
         for obj in candidates:
-            if obj.get("bridge") != "planmode.v1":
-                continue
-            stage = obj.get("stage")
-            if stage not in {"needs_input", "plan_ready"}:
-                continue
-            return obj
+            normalized = self._normalize_bridge_payload(obj)
+            if normalized:
+                return normalized
 
         return None
+
+    def _normalize_bridge_payload(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Normalize historical bridge payload variants to the canonical shape."""
+        if payload.get("bridge") == "planmode.v1":
+            stage = str(payload.get("stage") or "").strip().lower()
+            if stage in {"needs_input", "plan_ready"}:
+                return {
+                    "bridge": "planmode.v1",
+                    "stage": stage,
+                    "questions": payload.get("questions"),
+                    "plan_markdown": payload.get("plan_markdown", payload.get("plan")),
+                }
+
+        nested = payload.get("planmode.v1")
+        if isinstance(nested, dict):
+            return self._normalize_legacy_bridge_payload(nested)
+
+        return self._normalize_legacy_bridge_payload(payload)
+
+    def _normalize_legacy_bridge_payload(
+        self,
+        payload: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Best-effort normalization for historical JSON/YAML plan bridge outputs."""
+        stage = self._infer_bridge_stage(payload)
+        if stage is None:
+            return None
+
+        if stage == "needs_input":
+            questions = self._extract_bridge_questions(payload)
+            return {
+                "bridge": "planmode.v1",
+                "stage": "needs_input",
+                "questions": questions,
+            }
+
+        return {
+            "bridge": "planmode.v1",
+            "stage": "plan_ready",
+            "plan_markdown": self._extract_bridge_plan_markdown(payload),
+        }
+
+    def _infer_bridge_stage(self, payload: dict[str, object]) -> str | None:
+        """Infer plan bridge stage from canonical or legacy payload fields."""
+        explicit = str(payload.get("stage") or payload.get("status") or "").strip().lower()
+        if explicit in {"needs_input", "plan_ready"}:
+            return explicit
+
+        questions = self._extract_bridge_questions(payload)
+        if questions:
+            return "needs_input"
+
+        if bool(payload.get("ready_to_execute")):
+            return "plan_ready"
+
+        if bool(payload.get("execute_after_confirmation")):
+            return "plan_ready"
+
+        if any(payload.get(key) for key in ("plan_markdown", "plan", "steps", "acceptance_criteria", "pass_criteria")):
+            return "plan_ready"
+
+        return None
+
+    def _extract_bridge_questions(self, payload: dict[str, object]) -> list[str]:
+        """Collect human questions from legacy plan payloads."""
+        questions: list[str] = []
+        for key in ("questions", "pending_user_confirmation", "inputs_needed"):
+            questions.extend(self._collect_named_strings(payload, key))
+
+        unique: list[str] = []
+        seen: set[str] = set()
+        for question in questions:
+            normalized = " ".join(question.split())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(normalized)
+        return unique
+
+    def _collect_named_strings(self, node: object, name: str) -> list[str]:
+        """Recursively collect string-like values from matching keys."""
+        found: list[str] = []
+
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == name:
+                    found.extend(self._coerce_string_list(value))
+                if isinstance(value, (dict, list)):
+                    found.extend(self._collect_named_strings(value, name))
+            return found
+
+        if isinstance(node, list):
+            for item in node:
+                if isinstance(item, (dict, list)):
+                    found.extend(self._collect_named_strings(item, name))
+            return found
+
+        return found
+
+    def _coerce_string_list(self, value: object) -> list[str]:
+        """Best-effort conversion of structured values to human-readable strings."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, list):
+            items: list[str] = []
+            for item in value:
+                items.extend(self._coerce_string_list(item))
+            return items
+        if isinstance(value, dict):
+            lines: list[str] = []
+            for key, item in value.items():
+                nested = self._coerce_string_list(item)
+                if nested:
+                    if len(nested) == 1:
+                        lines.append(f"{key}: {nested[0]}")
+                    else:
+                        lines.append(f"{key}: {'; '.join(nested)}")
+            return lines
+        if isinstance(value, (int, float, bool)):
+            return [str(value)]
+        return []
+
+    def _extract_bridge_plan_markdown(self, payload: dict[str, object]) -> str:
+        """Convert legacy structured plans into concise markdown."""
+        plan_markdown = payload.get("plan_markdown")
+        if isinstance(plan_markdown, str) and plan_markdown.strip():
+            return plan_markdown.strip()
+
+        raw_plan = payload.get("plan")
+        if isinstance(raw_plan, str) and raw_plan.strip():
+            return raw_plan.strip()
+
+        lines: list[str] = []
+
+        goal = self._first_string(payload, "goal", "summary", "objective", "title")
+        if goal:
+            lines.append(f"目标：{goal}")
+
+        assumptions = self._collect_top_level_items(payload.get("assumptions"))
+        if assumptions:
+            lines.append("")
+            lines.append("假设：")
+            lines.extend(f"- {item}" for item in assumptions[:5])
+
+        constraints = self._collect_top_level_items(payload.get("constraints"))
+        if constraints:
+            lines.append("")
+            lines.append("约束：")
+            lines.extend(f"- {item}" for item in constraints[:5])
+
+        risks = self._collect_top_level_items(payload.get("risks") or payload.get("uncertainties"))
+        if risks:
+            lines.append("")
+            lines.append("风险/不确定性：")
+            lines.extend(f"- {item}" for item in risks[:5])
+
+        steps = payload.get("steps") or payload.get("plan")
+        if isinstance(steps, list) and steps:
+            lines.append("")
+            lines.append("步骤：")
+            for index, step in enumerate(steps[:8], 1):
+                lines.extend(self._render_plan_step(step, index))
+
+        acceptance = self._collect_top_level_items(
+            payload.get("acceptance_criteria") or payload.get("pass_criteria")
+        )
+        if acceptance:
+            lines.append("")
+            lines.append("验收标准：")
+            lines.extend(f"- {item}" for item in acceptance[:6])
+
+        if not lines:
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        return "\n".join(lines).strip()
+
+    def _first_string(self, payload: dict[str, object], *keys: str) -> str | None:
+        """Return the first non-empty string for given keys."""
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _collect_top_level_items(self, value: object) -> list[str]:
+        """Flatten a top-level structured section into short bullet items."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            items: list[str] = []
+            for item in value:
+                items.extend(self._collect_top_level_items(item))
+            return items
+        if isinstance(value, dict):
+            items: list[str] = []
+            for key, item in value.items():
+                nested = self._collect_top_level_items(item)
+                if nested:
+                    if len(nested) == 1:
+                        items.append(f"{key}: {nested[0]}")
+                    else:
+                        items.append(f"{key}: {'; '.join(nested)}")
+                elif isinstance(item, (str, int, float, bool)):
+                    items.append(f"{key}: {item}")
+            return items
+        if isinstance(value, str):
+            text = value.strip()
+            return [text] if text else []
+        if isinstance(value, (int, float, bool)):
+            return [str(value)]
+        return []
+
+    def _render_plan_step(self, step: object, index: int) -> list[str]:
+        """Render one structured plan step into short markdown lines."""
+        if isinstance(step, str):
+            text = step.strip()
+            return [f"{index}. {text}"] if text else []
+
+        if not isinstance(step, dict):
+            return [f"{index}. {json.dumps(step, ensure_ascii=False)}"]
+
+        step_id = step.get("id")
+        name = self._first_string(step, "name", "title")
+        label = name or f"步骤 {step_id or index}"
+        purpose = self._first_string(step, "purpose", "goal", "description")
+        header = f"{index}. {label}"
+        if purpose:
+            header = f"{header} — {purpose}"
+        lines = [header]
+
+        inputs_needed = self._collect_top_level_items(step.get("inputs_needed"))
+        if inputs_needed:
+            lines.append(f"   - 需要输入：{'；'.join(inputs_needed[:3])}")
+
+        commands = self._collect_top_level_items(step.get("commands") or step.get("command"))
+        if commands:
+            lines.append(f"   - 命令：{commands[0]}")
+
+        decision = self._collect_top_level_items(step.get("decision"))
+        if decision:
+            lines.append(f"   - 分支：{'；'.join(decision[:2])}")
+
+        expected = self._collect_top_level_items(
+            step.get("expected") or step.get("output") or step.get("verify")
+        )
+        if expected:
+            lines.append(f"   - 预期：{'；'.join(expected[:2])}")
+
+        return lines
+
+    def _maybe_backfill_bridge_payload(self, task: TaskStatus) -> None:
+        """Retrofit bridge fields for historical tasks that were parsed as none."""
+        if task.workflow_mode != "plan_bridge":
+            return
+        if task.bridge_stage != "none":
+            return
+        bridge_payload = self._extract_bridge_payload(task.output)
+        if bridge_payload:
+            self._apply_bridge_payload(task, bridge_payload)
 
     def _apply_bridge_payload(
         self,
@@ -767,8 +1066,18 @@ class TaskManager:
                 cmd.extend(["-c", "approval_policy=\"never\""])
         if req.resume_session_id:
             cmd.append(req.resume_session_id)
-        cmd.append(req.prompt)
+        prompt = req.prompt
+        if req.workflow_mode == "plan_bridge":
+            prompt = self._wrap_plan_bridge_prompt(prompt)
+        cmd.append(prompt)
         return cmd
+
+    def _wrap_plan_bridge_prompt(self, prompt: str) -> str:
+        """Append a strict output contract for plan bridge tasks."""
+        base_prompt = (prompt or "").strip()
+        if not base_prompt:
+            return PLAN_BRIDGE_PROTOCOL
+        return f"{base_prompt}\n\n{PLAN_BRIDGE_PROTOCOL}"
 
     def _archive_task(self, task_id: str) -> None:
         """Move a finished task from active to completed history."""

@@ -62,6 +62,12 @@ def main() -> None:
         body["parent_task_id"] = args.parent_task_id
 
     result = request("POST", "/tasks", body)
+    if isinstance(result, dict) and result.get("task_id") and not result.get("error"):
+        result = {
+            **result,
+            "next_action": "wait_for_notification",
+            "user_message": "任务已提交，等待 Codex-Listener 通知，不要立即轮询状态。",
+        }
     json_out(result)
 
 
