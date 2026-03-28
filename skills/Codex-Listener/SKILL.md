@@ -8,25 +8,18 @@ allowed-tools: Bash(python3 *)
 
 Delegate coding tasks to OpenAI Codex CLI through the codex-listener daemon.
 
-## IMPORTANT RULES
+## Rules
 
-1. **Submit 后必须立即收口。** `submit.py` 成功返回 JSON 后，当前轮必须直接回复用户“已提交 + task_id + 下一步”，然后停止；不要空转。
-2. **No polling.** Do NOT call `status.py` or `list_tasks.py` after submitting unless the user explicitly asks you to check a task's status.
-3. **Notification is automatic.** The daemon will notify the user through the configured messaging channel(s) (Feishu/Telegram) when the task finishes. You will NOT receive the result — just move on.
-4. **Use official submit path only.** Always use `scripts/submit.py` (or `POST /tasks` for manual HTTP). Do NOT use `/submit` or any other unofficial endpoint.
-5. **Status source of truth.** Task status must come only from `/tasks` APIs via `scripts/status.py` or `scripts/list_tasks.py`.
-6. **No inferred excuses.** If status query fails, report the raw JSON error and stop guessing. Do NOT claim "权限受限/系统拦截" unless the tool output explicitly says so.
-7. **No shell fallbacks for status.** Do NOT append `2>/dev/null`, `|| echo`, or pipes that change script output.
-8. **Do not use artifacts as status proxy.** Do NOT inspect `.codex/sessions` or output files to infer task state unless the user explicitly asks to verify deliverables.
-9. **Use explicit sandbox when needed.** Default sandbox follows server-side model defaults (currently `workspace-write`). For system-level tasks, explicitly pass `--sandbox danger-full-access`.
-10. **System tasks must include acceptance checks in the same prompt.** For installs/services/users/permissions, require "execute + verify + report verification output".
-11. **Complex tasks must enter PlanMode first.** Trigger PlanMode if any of: write/delete files >=2, any delete/overwrite/batch replace, estimated steps >=5, or system-level changes (packages/services/permissions/env).
-12. **Use Plan Bridge for multi-turn planning.** Submit stage-A with `--workflow-mode plan_bridge`; if result is `bridge_stage=needs_input`, collect user answers and continue with `--resume-session` (stage-B). Do not execute implementation until plan is ready.
-13. **Plan Bridge output contract is strict.** Planning tasks must end with exactly one JSON object: `{"bridge":"planmode.v1","stage":"needs_input","questions":[...]}` or `{"bridge":"planmode.v1","stage":"plan_ready","plan_markdown":"..."}`.
-14. **Tool 成功后必须有可见结论。** 任一 `submit.py` / `status.py` / `list_tasks.py` 成功返回 JSON 后，要么继续发起下一次必要脚本调用，要么立刻给出非空用户回复；禁止“结果拿到了但回答为空”。
-15. **JSON 结果优先直出。** 如果脚本输出已经足够回答问题，直接基于 JSON 给结论；若用户要求“原样返回 JSON”，就直接返回 JSON 主体，不再改写。
-16. **Plan Bridge 跟进看最新叶子任务。** 当用户跟进一条 plan_bridge 任务链的进展时，优先用 `list_tasks.py` 找该链的最新叶子 descendant，并以叶子任务状态作答，同时简要说明与根任务关系。
-17. **提交后停手。** 如果 `submit.py` 返回了 `task_id`、`workflow_mode`、`next_action`，正确做法就是确认已提交、给出 `task_id`、提示等待通知或去 `/tasks`；不要在同一轮再虚构任务号、追加状态查询或把自己绕进空回复。
+1. **提交后收口**：`submit.py` 成功后，当前轮只需回复"已提交 + task_id + next_action"即停止。不空转、不追加 status 查询、不虚构任务号。
+2. **No polling**：除非用户主动问，不调用 `status.py` / `list_tasks.py`。
+3. **通知自动推送**：完成通知走配置的消息通道（Telegram/微信），你不会收到结果——直接 move on。
+4. **仅用 `scripts/submit.py`**：不用 `/submit` 或其他非官方路径。状态唯一来源是 `/tasks` API。
+5. **不编造错误原因**：查询失败时原样返回 error，不猜测"权限受限"。不加 `2>/dev/null`、`|| echo` 等管道篡改输出。不检查 `.codex/sessions` 推断状态。
+6. **系统任务含验收**：安装/服务/权限类 prompt 须包含"执行 + 验证 + 返回验证输出"。需要 full access 时显式传 `--sandbox danger-full-access`。
+7. **复杂任务先 PlanMode**：写/删 ≥2 / 系统级改动 → 用 `--workflow-mode plan_bridge`。
+8. **Plan Bridge 输出契约**：planning 任务须以 `{"bridge":"planmode.v1","stage":"needs_input"|"plan_ready",...}` 结尾。
+9. **Plan Bridge 跟进**：用户问链进展时，先 `list_tasks.py` 找最新叶子 descendant，以叶子状态作答。
+10. **JSON 直出**：脚本输出足够回答时直接引用；用户要原始 JSON 就直接贴。
 
 ## Prerequisites
 
@@ -45,9 +38,8 @@ All scripts are in the `scripts/` directory relative to this skill.
 python3 scripts/submit.py --prompt "fix the type error in auth.py" --cwd /path/to/project
 # Returns: {"task_id": "a1b2c3d4", "status": "pending", ...}
 
-# 2. 立刻回复用户：已提交、task_id、下一步（优先复用 `user_message` / `next_action`）。
-# 3. Done. Move on to other work. The user will be notified through their configured channels when codex finishes.
-# The submit script returns `next_action=wait_for_notification`; treat that as the default happy path.
+# 2. 立刻回复用户：已提交、task_id、下一步（复用 next_action）。
+# 3. Done. Move on. The user will be notified through configured channels.
 ```
 
 Plan Bridge (two-stage):
@@ -91,92 +83,45 @@ python3 scripts/submit.py --workflow-mode plan_bridge --prompt "ask questions fi
 python3 scripts/submit.py --workflow-mode plan_bridge --resume-session <session_id> --parent-task-id <task_id> --prompt "answers: ..." --cwd /home/Hera/.nanobot/workspace
 ```
 
-The script above sends requests to `POST /tasks`. Do not hand-write `/submit`.
+Options: `--prompt` (required), `--model`, `--cwd`, `--sandbox`, `--reasoning-effort` (high/medium/low), `--workflow-mode`, `--resume-session`, `--parent-task-id`
 
-Options: `--prompt` (required), `--model`, `--cwd`, `--sandbox`, `--reasoning-effort` (high/medium/low, default: high), `--workflow-mode`, `--resume-session`, `--parent-task-id`
-
-### Cancel a task
+### Cancel / Health / Status
 
 ```bash
 python3 scripts/cancel.py --task-id <id>
-```
-
-### Health check
-
-```bash
 python3 scripts/health.py
-```
-
-### Check task status (only when user asks)
-
-```bash
 python3 scripts/status.py --task-id <id>
 python3 scripts/list_tasks.py
 ```
 
 Status handling:
-- If success: report the conclusion directly from JSON in the same turn.
-- Prefer a compact answer: current status, next step, and any key `error` / `next_action` / `user_message`.
-- If the user asked for raw JSON, return the JSON body directly.
-- If error: copy the `error` field verbatim, then run `python3 scripts/health.py` once and report result.
-- Do not switch to guessed narratives.
+- Success: report conclusion directly from JSON. Prefer compact: status + next step + key error/next_action.
+- Error: copy `error` verbatim, then `health.py` once.
+- User wants raw JSON: paste it directly.
 
-Plan Bridge handling:
-- If `bridge_stage=needs_input`: ask user for answers. Preferred reply format is `/plan-reply <task_id> <answer>`.
-- If the user asks “现在呢 / 跑完了吗 / 执行完成了吗” for a plan_bridge chain:
-  - First run `python3 scripts/list_tasks.py`
-  - Find the latest leaf descendant for that chain
-  - Answer based on the leaf task, and briefly mention the root task only as context
-- Telegram 常用入口优先使用 `/tasks`，它会展示：
-  - 待回答（`needs_input`）
-  - 可执行（`plan_ready`）
-  - 进行中（`pending/running`）
-  - 最近完成/失败
-- Telegram 菜单命令可无参选任务：
-  - `/plan-reply` 仅显示可回复的 `needs_input`
-  - `/plan-run` 仅显示可执行的 `plan_ready`
-  - `/plan-cancel` 仅显示可取消任务列表（`pending/running`）
-- Plan 执行权限选择：
-  - `/plan-run` 先选权限模式（Sandbox 或 Full Access）再二次确认执行
-  - 文本兼容：`/plan-run <task_id> sandbox|full`
-  - 禁止依赖后端默认 sandbox；执行任务必须显式传权限
-- 普通任务权限闸门（listener 侧）：
-  - 普通任务若未显式提供 sandbox，listener 会返回 `needs_input` 权限问题
-  - 在 Telegram 里用 `/plan-reply <task_id> sandbox|full`（或按钮预填）完成权限选择
-  - 仅在权限确定后才会创建真实执行任务
-- Natural-language reply is allowed only when there is exactly one pending `needs_input` task; otherwise require explicit `/plan-reply`.
-- Replying directly to a Codex-Listener notification message can auto-bind its `Task <task_id>`.
-- Continue by resubmitting with `--resume-session <session_id>` and `--parent-task-id <task_id>`.
-- 正常提交后不要立刻再跑 `status.py` / `list_tasks.py`；让通知通道回推结果。
-- Telegram button semantics:
-  - `✍️ 回复问题`: only pre-fills `/plan-reply <task_id> `, user must still send the final answer text.
-  - `✅ 执行计划`: requires second confirmation before creating execution task.
-  - `📝 继续修改`: route back to `/plan-reply <task_id> ...`.
-  - `❌ 取消`: cancel current execution intent and do not auto-submit implementation.
+## Plan Bridge Handling
 
-Result-closing templates:
+- `bridge_stage=needs_input`: ask user for answers. Preferred: `/plan-reply <task_id> <answer>`.
+- 用户跟进链进展 → `list_tasks.py` → 找最新叶子 → 以叶子状态回答。
+- 提交后不立刻轮询；让通知通道回推。
 
-- `submit.py` success:
-  - `已提交任务 <task_id>。<user_message 或 next_action 对应的人话说明>`
-  - 若 `next_action=wait_for_notification`：明确写“等待通知即可，不要立刻轮询状态”。
-- `status.py` success:
-  - `任务 <task_id> 当前状态：<status>。下一步：<next step>`
-- `list_tasks.py` success:
-  - 优先回答用户最关心的 1 个结论；若是任务链跟进，则回答最新叶子任务状态。
-  - 不要把列表读完后又不给结论。
-- Raw JSON mode:
-  - 用户明确要求“原样返回 JSON”时，直接粘贴脚本输出 JSON，不追加其它脚本。
+### Telegram 交互
+
+- `/tasks` 展示全局任务概览（待回答/可执行/进行中/已完成）
+- `/plan-reply` 仅显示 `needs_input` 任务
+- `/plan-run` 先选权限（Sandbox / Full Access）再确认执行
+- `/plan-cancel` 显示可取消列表
+- 普通任务未提供 sandbox → listener 返回 `needs_input` 权限问题
+- 回复 Codex-Listener 通知消息可自动绑定 task_id
+- Natural-language reply 仅在恰好一条 pending `needs_input` 时生效
+- 按钮语义：`✍️ 回复问题` = 预填 plan-reply / `✅ 执行计划` = 需二次确认 / `❌ 取消` = 终止
+
+## Result Templates
+
+- `submit.py` → `已提交任务 <task_id>。<next_action 人话说明>`
+- `status.py` → `任务 <task_id> 当前状态：<status>。下一步：<next>`
+- `list_tasks.py` → 回答最关心的 1 个结论；链跟进回答最新叶子。
 
 ## Output Format
 
-All scripts output a single JSON object to stdout. Exit code 0 = success, 1 = error.
-
-Submitted task:
-```json
-{"task_id": "a1b2c3d4", "status": "pending", ...}
-```
-
-Daemon not running:
-```json
-{"error": "codex-listener is not running. Start it with: codex-listener start"}
-```
+All scripts output JSON to stdout. Exit 0 = success, 1 = error.
