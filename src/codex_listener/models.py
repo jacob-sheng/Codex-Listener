@@ -14,7 +14,7 @@ class TaskCreate(BaseModel):
     prompt: str
     model: str = "gpt-5.3-codex"
     cwd: str = "."
-    sandbox: str = "workspace-write"
+    sandbox: str | None = None
     full_auto: bool = True
     reasoning_effort: str = "high"
     workflow_mode: Literal["normal", "plan_bridge"] = "normal"
